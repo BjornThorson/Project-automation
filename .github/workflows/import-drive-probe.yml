@@ -1,0 +1,136 @@
+
+name: Import ordinary-chat Drive probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install Google authentication libraries
+        run: python -m pip install google-auth requests
+
+      - name: Fetch and validate Drive submission
+        env:
+          DRIVE_READER_JSON: ${{ secrets.DRIVE_READER_JSON }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import AuthorizedSession
+
+          DOC_ID = "1zB4h01vA_Uz9WfQgDfyDlbtpr1_gYQr3lppoGUj2dKs"
+          EXPECTED_ID = "ordinary-chat-20261018-01"
+          EXPECTED_REPOSITORY = "bjornthorson/project-automation"
+          ALLOWED_PATHS = {
+              "deliveries/probe/hello.txt",
+              "deliveries/probe/config.yaml",
+              "deliveries/probe/nested/deeper/exact.txt",
+          }
+
+          secret = os.environ.get("DRIVE_READER_JSON")
+          if not secret:
+              raise RuntimeError("Missing DRIVE_READER_JSON secret")
+
+          credentials = service_account.Credentials.from_service_account_info(
+              json.loads(secret),
+              scopes=["https://www.googleapis.com/auth/drive.readonly"],
+          )
+
+          session = AuthorizedSession(credentials)
+          response = session.get(
+              f"https://www.googleapis.com/drive/v3/files/{DOC_ID}/export",
+              params={"mimeType": "text/plain"},
+              timeout=30,
+          )
+          response.raise_for_status()
+
+          submission = json.loads(response.content.decode("utf-8-sig"))
+
+          if submission.get("schema_version") != 1:
+              raise ValueError("Unsupported manifest schema")
+          if submission.get("submission_id") != EXPECTED_ID:
+              raise ValueError("Unexpected submission ID")
+          if submission.get("status") != "probe-only":
+              raise ValueError("Unexpected submission status")
+          if str(submission.get("repository", "")).casefold() != EXPECTED_REPOSITORY:
+              raise ValueError("Repository mismatch")
+
+          files = submission.get("files")
+          if not isinstance(files, list) or len(files) != len(ALLOWED_PATHS):
+              raise ValueError("Unexpected file count")
+
+          paths = [item.get("path") for item in files if isinstance(item, dict)]
+          if len(paths) != len(ALLOWED_PATHS) or set(paths) != ALLOWED_PATHS:
+              raise ValueError("Unapproved or duplicate file paths")
+
+          root = Path.cwd().resolve()
+          validated = []
+
+          for item in files:
+              if item.get("encoding") != "utf-8":
+                  raise ValueError("Unsupported file encoding")
+
+              content = item.get("content")
+              checksum = item.get("sha256")
+
+              if not isinstance(content, str) or not isinstance(checksum, str):
+                  raise ValueError("Invalid file content or checksum")
+
+              raw = content.encode("utf-8")
+              if len(raw) > 65536:
+                  raise ValueError("File exceeds pilot size limit")
+
+              actual = hashlib.sha256(raw).hexdigest()
+              if actual != checksum:
+                  raise ValueError(f"Checksum mismatch: {item['path']}")
+
+              target = (root / item["path"]).resolve()
+              if root not in target.parents:
+                  raise ValueError("Unsafe destination path")
+
+              validated.append((target, raw))
+
+          for target, raw in validated:
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(raw)
+              print(f"Verified: {target.relative_to(root)}")
+
+          print("Drive probe passed validation.")
+          PY
+
+      - name: Open pull request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          branch: automation/drive-probe
+          commit-message: "test: import verified Drive probe"
+          title: "Test ordinary-chat file delivery"
+          body: |
+            Imports the three files generated from an ordinary
+            ChatGPT conversation and staged privately in Google Drive.
+
+            File checksums are verified before creating this PR.
+            This is a feasibility test, not a production importer.
+          add-paths: |
+            deliveries/probe/
+            
