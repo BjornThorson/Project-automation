@@ -1,0 +1,3 @@
+tab:	CRLF:
+Unicode: café ⚡
+quote: " slash: \ trailing:  
