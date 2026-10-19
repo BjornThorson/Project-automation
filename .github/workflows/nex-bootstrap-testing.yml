@@ -1,0 +1,60 @@
+name: Nex bootstrap testing branches
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/nex-bootstrap-testing.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  create-testing:
+    name: Branch / ${{ matrix.repo }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { repo: 'cyberpunk-launcher', source: 'main' }
+          - { repo: 'deck-os-keyboard', source: 'main' }
+          - { repo: 'FlatMMO-Companion', source: 'main' }
+          - { repo: 'forge-layout-lab', source: 'main' }
+          - { repo: 'Mystical-Automation-Unoffical-Backport-1.20.1', source: 'main' }
+          - { repo: 'phaser-rpg', source: 'master' }
+          - { repo: 'phaser-rpg-template', source: 'main' }
+          - { repo: 'pocket-capture', source: 'main' }
+          - { repo: 'Project-automation', source: 'main' }
+          - { repo: 'Steph-s-Cozy-Shaders', source: 'main' }
+          - { repo: 'Stray_Frequency', source: 'main' }
+          - { repo: 'Test-TypeScript-Game', source: 'main' }
+          - { repo: 'ts-online-game-template', source: 'main' }
+          - { repo: 'Vercel-Test', source: 'main' }
+    steps:
+      - name: Get scoped GitHub App token
+        id: token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.NEX_APP_CLIENT_ID }}
+          private-key: ${{ secrets.NEX_APP_PRIVATE_KEY }}
+          owner: BjornThorson
+          repositories: ${{ matrix.repo }}
+          permission-contents: write
+      - name: Create testing from the current default branch
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          REPO_NAME: ${{ matrix.repo }}
+          SOURCE: ${{ matrix.source }}
+        run: |
+          set -euo pipefail
+          target="BjornThorson/${REPO_NAME}"
+          if gh api "repos/${target}/git/ref/heads/testing" >/dev/null 2>&1; then
+            echo "Testing branch already exists in ${target}; leaving it unchanged."
+          else
+            sha="$(gh api "repos/${target}/git/ref/heads/${SOURCE}" --jq '.object.sha')"
+            test -n "$sha"
+            gh api --method POST "repos/${target}/git/refs" \
+              -f ref='refs/heads/testing' -f sha="$sha" >/dev/null
+            echo "Created testing in ${target} from ${SOURCE} at ${sha}."
+          fi
+          gh api "repos/${target}/git/ref/heads/testing" --jq '.ref'
+          echo "Verified ${target}: testing branch exists" >> "$GITHUB_STEP_SUMMARY"
