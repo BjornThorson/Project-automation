@@ -1,0 +1,145 @@
+name: Test cross-repository Drive delivery
+
+on:
+  workflow_dispatch:
+
+# GITHUB_TOKEN is used only for the workflow's own repository.
+# All Vercel-Test writes use the repository-scoped GitHub App token.
+permissions:
+  contents: read
+
+jobs:
+  deliver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Validate required configuration
+        env:
+          NEX_APP_CLIENT_ID: ${{ vars.NEX_APP_CLIENT_ID }}
+          NEX_APP_PRIVATE_KEY: ${{ secrets.NEX_APP_PRIVATE_KEY }}
+          DRIVE_READER_JSON: ${{ secrets.DRIVE_READER_JSON }}
+        run: |
+          if [[ -z "$NEX_APP_CLIENT_ID" || -z "$NEX_APP_PRIVATE_KEY" || -z "$DRIVE_READER_JSON" ]]; then
+            echo 'Missing NEX_APP_CLIENT_ID, NEX_APP_PRIVATE_KEY, or DRIVE_READER_JSON.' >&2
+            exit 1
+          fi
+
+      - name: Generate GitHub App token for Vercel-Test only
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.NEX_APP_CLIENT_ID }}
+          private-key: ${{ secrets.NEX_APP_PRIVATE_KEY }}
+          owner: BjornThorson
+          repositories: Vercel-Test
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Check out destination repository
+        uses: actions/checkout@v7
+        with:
+          repository: BjornThorson/Vercel-Test
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install Google authentication libraries
+        run: python -m pip install google-auth requests
+
+      - name: Fetch and verify cross-repository submission
+        env:
+          DRIVE_READER_JSON: ${{ secrets.DRIVE_READER_JSON }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          from google.auth.transport.requests import AuthorizedSession
+          from google.oauth2 import service_account
+
+          DOC_ID = "11WNzOgtjdVz7xayg9XXLrn2SQHpiUuWeIavzTtJCZLo"
+          EXPECTED_SUBMISSION = "cross-repo-20261019-01"
+          EXPECTED_REPOSITORY = "bjornthorson/vercel-test"
+          EXPECTED_PATH = "deliveries/nex-routing-probe.txt"
+
+          raw_secret = os.environ.get("DRIVE_READER_JSON")
+          if not raw_secret:
+              raise RuntimeError("Missing DRIVE_READER_JSON secret")
+
+          credentials = service_account.Credentials.from_service_account_info(
+              json.loads(raw_secret),
+              scopes=["https://www.googleapis.com/auth/drive.readonly"],
+          )
+          session = AuthorizedSession(credentials)
+          response = session.get(
+              f"https://www.googleapis.com/drive/v3/files/{DOC_ID}/export",
+              params={"mimeType": "text/plain"},
+              timeout=30,
+          )
+          response.raise_for_status()
+          submission = json.loads(response.content.decode("utf-8-sig"))
+
+          if submission.get("schema_version") != 1:
+              raise ValueError("Unsupported manifest schema")
+          if submission.get("submission_id") != EXPECTED_SUBMISSION:
+              raise ValueError("Unexpected submission ID")
+          if submission.get("status") != "probe-only":
+              raise ValueError("Unexpected submission status")
+          if str(submission.get("repository", "")).casefold() != EXPECTED_REPOSITORY:
+              raise ValueError("Destination repository mismatch")
+
+          files = submission.get("files")
+          if not isinstance(files, list) or len(files) != 1:
+              raise ValueError("Pilot requires exactly one file")
+          entry = files[0]
+          if not isinstance(entry, dict) or entry.get("path") != EXPECTED_PATH:
+              raise ValueError("Unapproved file destination")
+          if entry.get("encoding") != "utf-8":
+              raise ValueError("Unsupported encoding")
+          content = entry.get("content")
+          expected_hash = entry.get("sha256")
+          if not isinstance(content, str) or not isinstance(expected_hash, str):
+              raise ValueError("Invalid content or checksum")
+          raw = content.encode("utf-8")
+          if len(raw) > 65536:
+              raise ValueError("Probe exceeds pilot file-size limit")
+          actual_hash = hashlib.sha256(raw).hexdigest()
+          if actual_hash != expected_hash:
+              raise ValueError("File checksum mismatch")
+
+          root = Path.cwd().resolve()
+          destination = (root / EXPECTED_PATH).resolve()
+          if root not in destination.parents:
+              raise ValueError("Unsafe destination path")
+          if destination.exists():
+              raise ValueError("Target already exists on the base branch")
+          destination.parent.mkdir(parents=True, exist_ok=True)
+          destination.write_bytes(raw)
+          if destination.read_bytes() != raw:
+              raise RuntimeError("File write verification failed")
+          print(f"Verified {EXPECTED_PATH} against SHA-256 {actual_hash}")
+          PY
+
+      - name: Create pull request in Vercel-Test
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          branch: automation/nex-cross-repo-probe-20261019
+          base: main
+          title: 'Test: Nex cross-repository delivery'
+          commit-message: 'test: verify cross-repository Drive delivery'
+          body: |
+            Test of ordinary ChatGPT → private Google Drive → central GitHub Actions
+            → scoped GitHub App token → Vercel-Test pull request.
+
+            The imported file passed SHA-256 validation.
+            This test does not automatically merge anything.
+          add-paths: |
+            deliveries/nex-routing-probe.txt
