@@ -3,14 +3,12 @@ name: Nex delivery router
 on:
   workflow_dispatch:
   schedule:
-    # Twice per hour. Scheduled workflows may start late on GitHub-hosted runners.
     - cron: '17,47 * * * *'
 
-# The hub uses its own GITHUB_TOKEN only when delivering to Project-automation.
-# Other repositories use an installation token scoped to the selected destination.
+# A GitHub App installation token handles writes, including workflow files.
+# The repository GITHUB_TOKEN is not used to deliver changes.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: nex-delivery-router
@@ -19,7 +17,7 @@ concurrency:
 jobs:
   deliver:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     steps:
       - name: Install Drive client dependencies
         run: python -m pip install 'google-auth>=2.35,<3' 'requests>=2.32,<3'
@@ -37,8 +35,7 @@ jobs:
           import re
           from pathlib import Path, PurePosixPath
 
-          # Explicit allowlist. A repository must ALSO have a GitHub App installation
-          # (except the hub itself), otherwise the scoped token request will fail.
+          # A repository MUST be on this list AND in the GitHub App's selected installation.
           REPOSITORIES = {
               "bjornthorson/project-automation": ("BjornThorson/Project-automation", "main"),
               "bjornthorson/cyberpunk-launcher": ("BjornThorson/cyberpunk-launcher", "main"),
@@ -55,131 +52,129 @@ jobs:
               "bjornthorson/ts-online-game-template": ("BjornThorson/ts-online-game-template", "main"),
               "bjornthorson/vercel-test": ("BjornThorson/Vercel-Test", "main"),
           }
-
-          DISALLOWED_PARTS = {
-              ".github", ".git", "node_modules", ".next", ".vercel", ".turbo",
-              "dist", ".env", "secrets", "credentials", "__pycache__",
+          FORBIDDEN_NAMES = {
+              ".git", "node_modules", ".next", ".vercel", ".turbo", "dist",
+              ".env", "secrets", "credentials", "__pycache__", ".ssh",
           }
-          DISALLOWED_SUFFIXES = {".pem", ".p12", ".pfx", ".key"}
+          FORBIDDEN_SUFFIXES = {".pem", ".p12", ".pfx", ".key"}
           SAFE_PATH = re.compile(r"[A-Za-z0-9_./+@() -]+")
           SAFE_SUBMISSION_ID = re.compile(r"[a-z0-9][a-z0-9-]{4,63}")
 
-          def output(key, value):
-              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
-                  stream.write(f"{key}={value}\n")
+          def output(name, value):
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+                  f.write(f"{name}={value}\n")
 
-          def check_path(path):
-              if not isinstance(path, str) or len(path) > 240 or not SAFE_PATH.fullmatch(path):
+          def validate_path(value):
+              if not isinstance(value, str) or len(value) > 240 or not SAFE_PATH.fullmatch(value):
                   raise ValueError("Invalid file path")
-              posix = PurePosixPath(path)
-              if path.startswith("/") or str(posix) != path or len(posix.parts) < 1:
-                  raise ValueError("Non-canonical file path")
-              if any(part in (".", "..") or part.startswith(".") or part.lower() in DISALLOWED_PARTS
-                     for part in posix.parts):
-                  raise ValueError(f"Protected file path: {path}")
-              if posix.name.lower() in ("id_rsa", "id_ed25519", "credentials.json"):
-                  raise ValueError("Key or credential file cannot be submitted")
-              if posix.suffix.lower() in DISALLOWED_SUFFIXES:
-                  raise ValueError("Key files cannot be submitted")
-              return path
+              p = PurePosixPath(value)
+              if p.is_absolute() or str(p) != value or not p.parts or ".." in p.parts:
+                  raise ValueError("Non-canonical destination path")
+              if any(part.lower() in FORBIDDEN_NAMES for part in p.parts):
+                  raise ValueError(f"Protected path: {value}")
+              if any(part.startswith(".") for part in p.parts):
+                  # Permit only GitHub Actions workflow declarations, not arbitrary GitHub settings.
+                  if not (len(p.parts) == 3 and p.parts[:2] == (".github", "workflows")
+                          and p.suffix in (".yml", ".yaml")):
+                      raise ValueError(f"Hidden/configuration path requires explicit policy: {value}")
+              if p.name.lower() in ("id_rsa", "id_ed25519", "credentials.json"):
+                  raise ValueError("Credentials cannot be delivered")
+              if p.suffix.lower() in FORBIDDEN_SUFFIXES:
+                  raise ValueError("Key file cannot be delivered")
+              return value
 
-          def validate(submission):
-              if not isinstance(submission, dict) or submission.get("schema_version") != 2:
+          def validate(item):
+              if not isinstance(item, dict) or item.get("schema_version") != 2:
                   raise ValueError("Expected schema_version 2")
-              if submission.get("status") == "idle":
+              if item.get("status") == "idle":
                   return None
-              if submission.get("status") != "ready":
-                  raise ValueError("Submission status must be 'ready' or 'idle'")
-              sid = submission.get("submission_id")
+              if item.get("status") != "ready":
+                  raise ValueError("Submission status must be ready or idle")
+              sid = item.get("submission_id")
               if not isinstance(sid, str) or not SAFE_SUBMISSION_ID.fullmatch(sid):
                   raise ValueError("Invalid submission ID")
-              requested_repo = submission.get("repository")
+              requested_repo = item.get("repository")
               if not isinstance(requested_repo, str) or requested_repo.casefold() not in REPOSITORIES:
-                  raise ValueError("Repository is not approved")
-              repository, base = REPOSITORIES[requested_repo.casefold()]
-              if submission.get("base_branch") != base:
-                  raise ValueError(f"Incorrect base branch, expected {base}")
-              files = submission.get("files")
-              if not isinstance(files, list) or not (1 <= len(files) <= 20):
+                  raise ValueError("Repository is not allowlisted")
+              repo, base = REPOSITORIES[requested_repo.casefold()]
+              if item.get("base_branch") != base:
+                  raise ValueError(f"Wrong base branch for {repo}, expected {base}")
+              files = item.get("files")
+              if not isinstance(files, list) or not 1 <= len(files) <= 20:
                   raise ValueError("Expected 1 to 20 files")
               seen, total_bytes = set(), 0
               for f in files:
                   if not isinstance(f, dict):
-                      raise ValueError("Malformed file entry")
-                  path = check_path(f.get("path"))
+                      raise ValueError("Invalid file entry")
+                  path = validate_path(f.get("path"))
                   if path in seen:
                       raise ValueError("Duplicate file path")
                   seen.add(path)
                   if f.get("operation") not in ("create", "update"):
-                      raise ValueError("Only create/update operations are allowed")
+                      raise ValueError("Only create and update operations are permitted")
                   if f.get("encoding") != "utf-8" or not isinstance(f.get("content"), str):
-                      raise ValueError("Only UTF-8 text files are supported")
-                  raw = f["content"].encode("utf-8")
-                  total_bytes += len(raw)
-                  if len(raw) > 65536 or total_bytes > 262144:
-                      raise ValueError("File or submission exceeds size limit")
-                  digest = f.get("sha256")
-                  if not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
-                      raise ValueError("Invalid SHA-256 field")
-                  if hashlib.sha256(raw).hexdigest() != digest:
-                      raise ValueError(f"SHA-256 mismatch for {path}")
+                      raise ValueError("Only UTF-8 text files are accepted")
+                  data = f["content"].encode("utf-8")
+                  total_bytes += len(data)
+                  if len(data) > 65536 or total_bytes > 262144:
+                      raise ValueError("Submission exceeds size limits")
+                  expected = f.get("sha256")
+                  if not isinstance(expected, str) or not re.fullmatch("[a-f0-9]{64}", expected):
+                      raise ValueError("Invalid SHA-256")
+                  if hashlib.sha256(data).hexdigest() != expected:
+                      raise ValueError(f"SHA-256 mismatch: {path}")
                   if f["operation"] == "update":
                       previous = f.get("previous_sha256")
-                      if not isinstance(previous, str) or not re.fullmatch(r"[a-f0-9]{64}", previous):
-                          raise ValueError("Updates require previous_sha256 to prevent overwriting concurrent edits")
-              return repository, base, sid, [f["path"] for f in files]
+                      if not isinstance(previous, str) or not re.fullmatch("[a-f0-9]{64}", previous):
+                          raise ValueError("Update requires previous_sha256")
+              return repo, base, sid, [f["path"] for f in files]
 
           def main():
               from google.auth.transport.requests import AuthorizedSession
               from google.oauth2 import service_account
-
-              secret = os.getenv("DRIVE_READER_JSON")
+              secret = os.environ.get("DRIVE_READER_JSON")
               if not secret:
-                  raise RuntimeError("Missing DRIVE_READER_JSON secret")
+                  raise RuntimeError("Missing DRIVE_READER_JSON")
               credentials = service_account.Credentials.from_service_account_info(
-                  json.loads(secret),
-                  scopes=["https://www.googleapis.com/auth/drive.readonly"],
+                  json.loads(secret), scopes=["https://www.googleapis.com/auth/drive.readonly"]
               )
-              session = AuthorizedSession(credentials)
-              response = session.get(
+              response = AuthorizedSession(credentials).get(
                   f"https://www.googleapis.com/drive/v3/files/{os.environ['INBOX_DOC_ID']}/export",
-                  params={"mimeType": "text/plain"},
-                  timeout=30,
+                  params={"mimeType": "text/plain"}, timeout=30,
               )
               response.raise_for_status()
               if len(response.content) > 524288:
-                  raise ValueError("Inbox document exceeds 512 KiB")
+                  raise ValueError("Drive inbox too large")
               submission = json.loads(response.content.decode("utf-8-sig"))
               result = validate(submission)
               if result is None:
-                  print("Inbox idle: no delivery required")
                   output("ready", "false")
+                  print("Inbox idle")
                   return
-              repository, base, sid, paths = result
-              queue_path = Path(os.environ["RUNNER_TEMP"]) / "nex-verified-submission.json"
-              queue_path.write_text(json.dumps(submission, ensure_ascii=False), encoding="utf-8")
-              queue_path.chmod(0o600)
+              repo, base, sid, paths = result
+              target = Path(os.environ["RUNNER_TEMP"]) / "nex-verified-submission.json"
+              target.write_text(json.dumps(submission, ensure_ascii=False), encoding="utf-8")
+              target.chmod(0o600)
               output("ready", "true")
-              output("repository", repository)
-              output("repo_name", repository.split("/", 1)[1])
+              output("repository", repo)
+              output("repo_name", repo.split("/", 1)[1])
               output("base_branch", base)
               output("submission_id", sid)
               output("branch", f"automation/nex-{sid}")
-              output("use_app", "false" if repository.casefold() == "bjornthorson/project-automation" else "true")
-              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
-                  stream.write("paths<<NEX_PATHS_END\n")
-                  stream.write("\n".join(paths))
-                  stream.write("\nNEX_PATHS_END\n")
-              print(f"Validated {sid}: {len(paths)} files for {repository}")
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+                  f.write("paths<<NEX_PATHS_END\n")
+                  f.write("\n".join(paths))
+                  f.write("\nNEX_PATHS_END\n")
+              print(f"Validated {sid}: {len(paths)} files -> {repo}")
 
           if __name__ == "__main__":
               main()
           PYTHON
           python "$RUNNER_TEMP/nex_delivery.py"
 
-      - name: Get token scoped to target repository
+      - name: Generate GitHub App token for destination
         id: app-token
-        if: steps.inbox.outputs.ready == 'true' && steps.inbox.outputs.use_app == 'true'
+        if: steps.inbox.outputs.ready == 'true'
         uses: actions/create-github-app-token@v3
         with:
           client-id: ${{ vars.NEX_APP_CLIENT_ID }}
@@ -188,14 +183,15 @@ jobs:
           repositories: ${{ steps.inbox.outputs.repo_name }}
           permission-contents: write
           permission-pull-requests: write
+          permission-workflows: write
 
-      - name: Checkout destination repository
+      - name: Check out destination repository
         if: steps.inbox.outputs.ready == 'true'
         uses: actions/checkout@v7
         with:
           repository: ${{ steps.inbox.outputs.repository }}
           ref: ${{ steps.inbox.outputs.base_branch }}
-          token: ${{ steps.app-token.outputs.token || github.token }}
+          token: ${{ steps.app-token.outputs.token }}
           persist-credentials: false
 
       - name: Apply verified files
@@ -206,62 +202,82 @@ jobs:
           import json
           import os
           from pathlib import Path
-
-          manifest = json.loads((Path(os.environ["RUNNER_TEMP"]) / "nex-verified-submission.json").read_text(encoding="utf-8"))
+          submission = json.loads((Path(os.environ["RUNNER_TEMP"]) / "nex-verified-submission.json").read_text(encoding="utf-8"))
           root = Path.cwd().resolve()
-
-          # Every file was previously validated and approved for this repository.
-          # No submitted code is executed by the delivery workflow.
-          for file in manifest["files"]:
-              path = file["path"]
-              data = file["content"].encode("utf-8")
-              if hashlib.sha256(data).hexdigest() != file["sha256"]:
-                  raise ValueError("In-memory payload differs from manifest")
+          for f in submission["files"]:
+              path = f["path"]
+              data = f["content"].encode("utf-8")
+              if hashlib.sha256(data).hexdigest() != f["sha256"]:
+                  raise ValueError("Payload checksum changed")
               target = root / path
-              resolved = target.resolve()
-              if root not in resolved.parents:
+              if root not in target.resolve().parents:
                   raise ValueError("Destination escaped repository")
-              if any(p.is_symlink() for p in [target] + list(target.parents) if p == root or root in p.parents):
-                  raise ValueError("Symlinked destination path disallowed")
-
-              existing = target.is_file()
-              if file["operation"] == "create":
+              if any(p.is_symlink() for p in [target, *target.parents] if p == root or root in p.parents):
+                  raise ValueError("Symlinked destination rejected")
+              exists = target.is_file()
+              if f["operation"] == "create":
                   if target.exists():
-                      if existing and target.read_bytes() == data:
+                      if exists and target.read_bytes() == data:
                           print(f"Already present: {path}")
                           continue
                       raise ValueError(f"Create target exists: {path}")
               else:
-                  if not existing:
-                      raise ValueError(f"Update target not found: {path}")
+                  if not exists:
+                      raise ValueError(f"Update target missing: {path}")
                   old = target.read_bytes()
-                  if hashlib.sha256(old).hexdigest() != file["previous_sha256"]:
+                  if hashlib.sha256(old).hexdigest() != f["previous_sha256"]:
                       if old == data:
                           print(f"Already updated: {path}")
                           continue
-                      raise ValueError(f"Baseline checksum changed: {path}")
+                      raise ValueError(f"Baseline SHA-256 mismatch: {path}")
                   if old == data:
-                      print(f"No changes: {path}")
+                      print(f"Unchanged: {path}")
                       continue
-
               target.parent.mkdir(parents=True, exist_ok=True)
               target.write_bytes(data)
               if target.read_bytes() != data:
-                  raise RuntimeError(f"Post-write verification failed: {path}")
+                  raise RuntimeError(f"Write verification failed: {path}")
               print(f"Verified file: {path}")
           PYTHON
 
-      - name: Open pull request in destination
-        if: steps.inbox.outputs.ready == 'true'
+      - name: Commit directly in setup mode
+        if: steps.inbox.outputs.ready == 'true' && vars.NEX_SETUP_MODE == 'true'
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          SUBMISSION_ID: ${{ steps.inbox.outputs.submission_id }}
+          TARGET_BASE: ${{ steps.inbox.outputs.base_branch }}
+        run: |
+          set -euo pipefail
+          python - <<'PYTHON'
+          import json, os, subprocess
+          from pathlib import Path
+          item = json.loads((Path(os.environ["RUNNER_TEMP"]) / "nex-verified-submission.json").read_text(encoding="utf-8"))
+          subprocess.run(["git", "add", "--", *[f["path"] for f in item["files"]]], check=True)
+          PYTHON
+          if git diff --cached --quiet; then
+            echo 'Submission already applied: no commit needed.'
+            exit 0
+          fi
+          git config user.name 'nex-project-automation[bot]'
+          git config user.email 'nex-project-automation[bot]@users.noreply.github.com'
+          git commit -m "chore: Nex delivery ${SUBMISSION_ID}"
+          # The scoped App token is used only for this Git invocation, never written to git config.
+          encoded_auth=$(printf 'x-access-token:%s' "$APP_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${encoded_auth}" \
+            push origin "HEAD:refs/heads/${TARGET_BASE}"
+          echo 'Applied submission directly to destination default branch.'
+
+      - name: Open pull request in review mode
+        if: steps.inbox.outputs.ready == 'true' && vars.NEX_SETUP_MODE != 'true'
         uses: peter-evans/create-pull-request@v8
         with:
-          token: ${{ steps.app-token.outputs.token || github.token }}
+          token: ${{ steps.app-token.outputs.token }}
           branch: ${{ steps.inbox.outputs.branch }}
           base: ${{ steps.inbox.outputs.base_branch }}
           title: 'Nex delivery: ${{ steps.inbox.outputs.submission_id }}'
           commit-message: 'chore: Nex delivery ${{ steps.inbox.outputs.submission_id }}'
           body: |
-            Automated proposal staged from an ordinary ChatGPT conversation.
-            Target repository and file paths were allowlisted and SHA-256 verified.
-            Review the changes before merging. This workflow never merges PRs.
+            Automated proposal submitted through the Nex delivery router.
+            Destination, file paths, content digests and existing-file baselines were validated.
+            Review and merge when appropriate.
           add-paths: ${{ steps.inbox.outputs.paths }}
