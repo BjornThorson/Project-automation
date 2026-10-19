@@ -8,7 +8,8 @@ on:
 # A GitHub App installation token handles writes, including workflow files.
 # The repository GITHUB_TOKEN is not used to deliver changes.
 permissions:
-  contents: read
+  contents: write
+  actions: write
 
 concurrency:
   group: nex-delivery-router
@@ -26,6 +27,7 @@ jobs:
         id: inbox
         env:
           DRIVE_READER_JSON: ${{ secrets.DRIVE_READER_JSON }}
+          ROUTER_TOKEN: ${{ github.token }}
           INBOX_DOC_ID: 18xbv9rQzAOyDvth7WCO2DeKW4TRXU8aeVcAow5VZMf0
         run: |
           cat > "$RUNNER_TEMP/nex_delivery.py" <<'PYTHON'
@@ -33,6 +35,7 @@ jobs:
           import json
           import os
           import re
+          import requests
           from pathlib import Path, PurePosixPath
 
           # A repository MUST be on this list AND in the GitHub App's selected installation.
@@ -99,6 +102,15 @@ jobs:
               repo, base = REPOSITORIES[requested_repo.casefold()]
               if item.get("base_branch") != base:
                   raise ValueError(f"Wrong base branch for {repo}, expected {base}")
+              kind = item.get("kind", "files")
+              if kind == "diagnostic":
+                  if item.get("profile") not in ("npm-build", "npm-test", "playwright", "shader", "gradle"):
+                      raise ValueError("Diagnostic profile not approved")
+                  if item.get("ref") != base and not (repo.endswith("/FlatMMO-Companion") and item.get("ref") == "v2-online"):
+                      raise ValueError("Diagnostic ref not approved")
+                  return repo, base, sid, []
+              if kind != "files":
+                  raise ValueError("Unknown submission kind")
               files = item.get("files")
               if not isinstance(files, list) or not 1 <= len(files) <= 20:
                   raise ValueError("Expected 1 to 20 files")
@@ -146,6 +158,37 @@ jobs:
               if len(response.content) > 524288:
                   raise ValueError("Drive inbox too large")
               submission = json.loads(response.content.decode("utf-8-sig"))
+              # Queue v3 supports up to 50 append-only submission objects.
+              # A durable receipt prevents a finished or failed job from replaying.
+              if submission.get("schema_version") == 3:
+                  if submission.get("status") not in ("active", "idle"):
+                      raise ValueError("Invalid queue status")
+                  entries = submission.get("queue")
+                  if not isinstance(entries, list) or len(entries) > 50:
+                      raise ValueError("Invalid queue contents")
+                  chosen, ids = None, set()
+                  for entry in entries:
+                      if not isinstance(entry, dict):
+                          raise ValueError("Malformed queue item")
+                      sid = entry.get("submission_id")
+                      if not isinstance(sid, str) or not SAFE_SUBMISSION_ID.fullmatch(sid) or sid in ids:
+                          raise ValueError("Invalid or duplicated queued submission ID")
+                      ids.add(sid)
+                      if entry.get("status") != "ready" or submission["status"] == "idle":
+                          continue
+                      receipt_url = ("https://api.github.com/repos/BjornThorson/Project-automation"
+                                     f"/contents/automation/receipts/{sid}.json")
+                      lookup = requests.get(receipt_url, headers={
+                          "Authorization": "Bearer " + os.environ["ROUTER_TOKEN"],
+                          "Accept": "application/vnd.github+json"
+                      }, timeout=20)
+                      if lookup.status_code == 200:
+                          continue
+                      if lookup.status_code != 404:
+                          lookup.raise_for_status()
+                      chosen = entry
+                      break
+                  submission = chosen or {"schema_version": 2, "status": "idle"}
               result = validate(submission)
               if result is None:
                   output("ready", "false")
@@ -156,6 +199,9 @@ jobs:
               target.write_text(json.dumps(submission, ensure_ascii=False), encoding="utf-8")
               target.chmod(0o600)
               output("ready", "true")
+              output("kind", submission.get("kind", "files"))
+              output("profile", submission.get("profile", ""))
+              output("diagnostic_ref", submission.get("ref", ""))
               output("repository", repo)
               output("repo_name", repo.split("/", 1)[1])
               output("base_branch", base)
@@ -174,7 +220,7 @@ jobs:
 
       - name: Generate GitHub App token for destination
         id: app-token
-        if: steps.inbox.outputs.ready == 'true'
+        if: steps.inbox.outputs.ready == 'true' && steps.inbox.outputs.kind == 'files'
         uses: actions/create-github-app-token@v3
         with:
           client-id: ${{ vars.NEX_APP_CLIENT_ID }}
@@ -186,7 +232,7 @@ jobs:
           permission-workflows: write
 
       - name: Check out destination repository
-        if: steps.inbox.outputs.ready == 'true'
+        if: steps.inbox.outputs.ready == 'true' && steps.inbox.outputs.kind == 'files'
         uses: actions/checkout@v7
         with:
           repository: ${{ steps.inbox.outputs.repository }}
@@ -195,7 +241,7 @@ jobs:
           persist-credentials: false
 
       - name: Apply verified files
-        if: steps.inbox.outputs.ready == 'true'
+        if: steps.inbox.outputs.ready == 'true' && steps.inbox.outputs.kind == 'files'
         run: |
           python - <<'PYTHON'
           import hashlib
@@ -241,7 +287,7 @@ jobs:
           PYTHON
 
       - name: Commit directly in setup mode
-        if: steps.inbox.outputs.ready == 'true' && vars.NEX_SETUP_MODE == 'true'
+        if: steps.inbox.outputs.ready == 'true' && steps.inbox.outputs.kind == 'files' && vars.NEX_SETUP_MODE == 'true'
         env:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
           SUBMISSION_ID: ${{ steps.inbox.outputs.submission_id }}
@@ -268,7 +314,7 @@ jobs:
           echo 'Applied submission directly to destination default branch.'
 
       - name: Open pull request in review mode
-        if: steps.inbox.outputs.ready == 'true' && vars.NEX_SETUP_MODE != 'true'
+        if: steps.inbox.outputs.ready == 'true' && steps.inbox.outputs.kind == 'files' && vars.NEX_SETUP_MODE != 'true'
         uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ steps.app-token.outputs.token }}
@@ -281,3 +327,52 @@ jobs:
             Destination, file paths, content digests and existing-file baselines were validated.
             Review and merge when appropriate.
           add-paths: ${{ steps.inbox.outputs.paths }}
+
+      - name: Dispatch approved diagnostic
+        if: steps.inbox.outputs.ready == 'true' && steps.inbox.outputs.kind == 'diagnostic'
+        env:
+          GH_AUTH: ${{ github.token }}
+          TARGET_REPO: ${{ steps.inbox.outputs.repo_name }}
+          PROFILE: ${{ steps.inbox.outputs.profile }}
+          REF: ${{ steps.inbox.outputs.diagnostic_ref }}
+        run: |
+          python - <<'PYTHON'
+          import os, requests
+          url = "https://api.github.com/repos/BjornThorson/Project-automation/actions/workflows/nex-diagnostics.yml/dispatches"
+          response = requests.post(url, headers={"Authorization": "Bearer " + os.environ["GH_AUTH"], "Accept": "application/vnd.github+json"},
+                                   json={"ref": "main", "inputs": {"repository": os.environ["TARGET_REPO"], "profile": os.environ["PROFILE"], "ref": os.environ["REF"]}}, timeout=20)
+          response.raise_for_status()
+          print("Diagnostic run dispatched.")
+          PYTHON
+
+      - name: Save delivery receipt
+        if: always() && steps.inbox.outputs.ready == 'true'
+        env:
+          GH_AUTH: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+          SID: ${{ steps.inbox.outputs.submission_id }}
+          DESTINATION: ${{ steps.inbox.outputs.repository }}
+          KIND: ${{ steps.inbox.outputs.kind }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python - <<'PYTHON'
+          import os, json, base64, datetime, requests
+          sid = os.environ["SID"]
+          status = "completed" if os.environ["JOB_STATUS"] == "success" else "failed"
+          receipt = {"schema_version": 1, "submission_id": sid, "status": status,
+                     "kind": os.environ["KIND"], "repository": os.environ["DESTINATION"],
+                     "workflow_run": os.environ["RUN_URL"],
+                     "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+          url = f"https://api.github.com/repos/BjornThorson/Project-automation/contents/automation/receipts/{sid}.json"
+          headers = {"Authorization": "Bearer " + os.environ["GH_AUTH"], "Accept": "application/vnd.github+json"}
+          previous = requests.get(url, headers=headers, timeout=20)
+          if previous.status_code not in (200, 404):
+              previous.raise_for_status()
+          body = {"message": f"chore: receipt for {sid}", "branch": "main",
+                  "content": base64.b64encode((json.dumps(receipt, indent=2) + "\n").encode()).decode()}
+          if previous.status_code == 200:
+              body["sha"] = previous.json()["sha"]
+          write = requests.put(url, headers=headers, json=body, timeout=20)
+          write.raise_for_status()
+          print(f"Saved {status} receipt for {sid}")
+          PYTHON

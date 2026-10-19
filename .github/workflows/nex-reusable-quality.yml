@@ -1,0 +1,55 @@
+name: Nex reusable quality gate
+on:
+  workflow_call:
+    inputs:
+      profile:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Approve diagnostic profile
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          case "$PROFILE" in
+            npm-build|npm-test|playwright|shader|gradle) echo "Approved: $PROFILE" ;;
+            *) echo "Unknown profile" >&2; exit 1 ;;
+          esac
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        if: contains(fromJSON('["npm-build","npm-test","playwright"]'), inputs.profile)
+        with:
+          node-version: '22'
+      - name: Install locked npm dependencies
+        if: contains(fromJSON('["npm-build","npm-test","playwright"]'), inputs.profile)
+        run: npm ci
+      - name: Install browser dependencies
+        if: inputs.profile == 'playwright'
+        run: npx playwright install --with-deps chromium
+      - name: Build Node project
+        if: inputs.profile == 'npm-build'
+        run: npm run build
+      - name: Test Node project
+        if: inputs.profile == 'npm-test' || inputs.profile == 'playwright'
+        run: npm test
+      - name: Install GLSL tools
+        if: inputs.profile == 'shader'
+        run: sudo apt-get update && sudo apt-get install -y glslang-tools
+      - name: Run shader validation
+        if: inputs.profile == 'shader'
+        run: bash tools/validate_glsl.sh
+      - uses: actions/setup-java@v4
+        if: inputs.profile == 'gradle'
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Build Gradle project
+        if: inputs.profile == 'gradle'
+        run: bash ./gradlew build --no-daemon

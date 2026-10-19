@@ -1,0 +1,115 @@
+name: Nex on-demand diagnostics
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        required: true
+        type: choice
+        options:
+          - Project-automation
+          - cyberpunk-launcher
+          - deck-os-keyboard
+          - FlatMMO-Companion
+          - forge-layout-lab
+          - Mystical-Automation-Unoffical-Backport-1.20.1
+          - phaser-rpg
+          - phaser-rpg-template
+          - pocket-capture
+          - Steph-s-Cozy-Shaders
+          - Stray_Frequency
+          - Test-TypeScript-Game
+          - ts-online-game-template
+          - Vercel-Test
+      profile:
+        required: true
+        type: choice
+        options:
+          - npm-build
+          - npm-test
+          - playwright
+          - shader
+          - gradle
+      ref:
+        required: true
+        type: choice
+        options:
+          - main
+          - master
+          - v2-online
+permissions:
+  contents: read
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Validate repository branch pairing
+        env:
+          REF: ${{ inputs.ref }}
+          REPO: ${{ inputs.repository }}
+        run: |
+          case "$REPO:$REF" in
+            phaser-rpg:master|FlatMMO-Companion:v2-online|*:main) ;;
+            *) echo "Repository/ref combination not permitted" >&2; exit 1 ;;
+          esac
+      - uses: actions/create-github-app-token@v3
+        id: token
+        with:
+          client-id: ${{ vars.NEX_APP_CLIENT_ID }}
+          private-key: ${{ secrets.NEX_APP_PRIVATE_KEY }}
+          owner: BjornThorson
+          repositories: ${{ inputs.repository }}
+          permission-contents: read
+      - uses: actions/checkout@v7
+        with:
+          repository: BjornThorson/${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          token: ${{ steps.token.outputs.token }}
+          persist-credentials: false
+      - name: Validate profile
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          case "$PROFILE" in
+            npm-build|npm-test|playwright|shader|gradle) ;;
+            *) echo "Invalid profile" >&2; exit 1 ;;
+          esac
+      - uses: actions/setup-node@v7
+        if: contains(fromJSON('["npm-build","npm-test","playwright"]'), inputs.profile)
+        with:
+          node-version: '22'
+      - name: Install locked dependencies
+        if: contains(fromJSON('["npm-build","npm-test","playwright"]'), inputs.profile)
+        run: npm ci
+      - name: Install Chromium
+        if: inputs.profile == 'playwright'
+        run: npx playwright install --with-deps chromium
+      - name: Run Node build
+        if: inputs.profile == 'npm-build'
+        run: npm run build
+      - name: Run Node tests
+        if: inputs.profile == 'npm-test' || inputs.profile == 'playwright'
+        run: npm test
+      - name: Install GLSL tools
+        if: inputs.profile == 'shader'
+        run: sudo apt-get update && sudo apt-get install -y glslang-tools
+      - name: Run GLSL checks
+        if: inputs.profile == 'shader'
+        run: bash tools/validate_glsl.sh
+      - uses: actions/setup-java@v4
+        if: inputs.profile == 'gradle'
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Run Gradle build
+        if: inputs.profile == 'gradle'
+        run: bash ./gradlew build --no-daemon
+      - name: Publish job summary
+        if: always()
+        env:
+          TARGET: ${{ inputs.repository }}
+          REF: ${{ inputs.ref }}
+          PROFILE: ${{ inputs.profile }}
+          STATUS: ${{ job.status }}
+        run: |
+          printf '## Nex diagnostics\n\nRepository: %s\nRef: %s\nProfile: %s\nResult: %s\n' "$TARGET" "$REF" "$PROFILE" "$STATUS" >> "$GITHUB_STEP_SUMMARY"
