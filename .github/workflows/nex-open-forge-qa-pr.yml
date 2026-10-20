@@ -1,0 +1,55 @@
+# One-shot Forge Layout Lab PR creation through the pre-authorized GitHub App.
+name: Nex open Forge QA pull request
+on:
+  push:
+    branches: [testing]
+    paths:
+      - '.github/workflows/nex-open-forge-qa-pr.yml'
+permissions:
+  contents: read
+jobs:
+  propose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Get scoped GitHub App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.NEX_APP_CLIENT_ID }}
+          private-key: ${{ secrets.NEX_APP_PRIVATE_KEY }}
+          owner: BjornThorson
+          repositories: forge-layout-lab
+          permission-pull-requests: write
+          permission-contents: read
+      - name: Propose verified Forge testing changes for review
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          repo='BjornThorson/forge-layout-lab'
+          expected_head='96b8d5bea3b7732059111b30c5745d883650d407'
+          actual_head="$(gh api "repos/${repo}/branches/testing" --jq '.commit.sha')"
+          if [ "$actual_head" != "$expected_head" ]; then
+            echo "Forge testing moved; must re-review diff before proposing a PR." >&2
+            exit 1
+          fi
+          existing="$(gh api "repos/${repo}/pulls?state=open&base=main&head=BjornThorson%3Atesting" --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            echo "Review PR #$existing already exists; leaving it unchanged."
+            exit 0
+          fi
+          comparison="$(gh api "repos/${repo}/compare/main...testing")"
+          status="$(echo "$comparison" | jq -r '.status')"
+          ahead="$(echo "$comparison" | jq -r '.ahead_by')"
+          behind="$(echo "$comparison" | jq -r '.behind_by')"
+          if [ "$status" != 'ahead' ] || [ "$ahead" != '1' ] || [ "$behind" != '0' ]; then
+            echo "Unexpected branch difference; refusing PR creation." >&2
+            exit 1
+          fi
+          gh api --method POST "repos/${repo}/pulls" \
+            -f title='Add portable Playwright CI quality gate' \
+            -f head=testing \
+            -f base=main \
+            -f body='QA pilot: adds the Nex reusable browser-test workflow and replaces hard-coded Vercel file paths in four existing test scripts with repository-relative paths. The testing-branch quality check passed in Actions run 39481091839. Please review the PR diff and wait for any PR-triggered checks before merging. This workflow creates a PR only; it never merges or bypasses protection.' \
+            --jq '{number,html_url,state,base:.base.ref,head:.head.ref}'
