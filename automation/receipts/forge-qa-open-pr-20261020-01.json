@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "submission_id": "forge-qa-open-pr-20261020-01",
+  "status": "completed",
+  "kind": "files",
+  "repository": "BjornThorson/Project-automation",
+  "workflow_run": "https://github.com/BjornThorson/Project-automation/actions/runs/39504251588",
+  "completed_at": "2026-10-20T21:55:54.926318+00:00"
+}
