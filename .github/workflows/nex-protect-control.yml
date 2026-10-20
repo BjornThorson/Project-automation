@@ -1,0 +1,118 @@
+# One-time control-plane protection, after verified independent receipt delivery.
+# If Administration:write is not already granted, token creation fails before any edits.
+name: Nex protect Project Automation production
+on:
+  push:
+    branches: [testing]
+    paths:
+      - '.github/workflows/nex-protect-control.yml'
+permissions:
+  contents: read
+jobs:
+  protect:
+    name: Protect ${{ matrix.repo }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { repo: 'Project-automation', production: 'main' }
+    steps:
+      - name: Request scoped existing GitHub App administration permission
+        id: auth
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.NEX_APP_CLIENT_ID }}
+          private-key: ${{ secrets.NEX_APP_PRIVATE_KEY }}
+          owner: BjornThorson
+          repositories: ${{ matrix.repo }}
+          permission-administration: write
+      - name: Safely install one production ruleset
+        env:
+          GH_TOKEN: ${{ steps.auth.outputs.token }}
+          TARGET_REPO: ${{ matrix.repo }}
+          EXPECTED_BRANCH: ${{ matrix.production }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          repo = os.environ["TARGET_REPO"]
+          expected = os.environ["EXPECTED_BRANCH"]
+          owner = "BjornThorson"
+          path = f"repos/{owner}/{repo}"
+          def get(url):
+              raw = subprocess.check_output(["gh","api",url],text=True)
+              return json.loads(raw)
+          details = get(path)
+          if details["default_branch"] != expected:
+              raise SystemExit(f"Default branch changed for {repo}: refusing update")
+          if repo != "Project-automation" or expected != "main":
+              raise SystemExit("Unexpected ruleset target: refusing")
+          # Prove current main operates with the separate receipt ledger.
+          import base64
+          router = get(f"{path}/contents/.github/workflows/nex-delivery-router.yml?ref=main")
+          router_text = base64.b64decode(router["content"]).decode("utf-8")
+          if ('("main", "nex-receipts")' not in router_text
+              or 'ledger_branch = "nex-receipts"' not in router_text):
+              raise SystemExit("The production router has not migrated its receipts")
+          receipt = get(f"{path}/contents/automation/receipts/forge-pr-gate-20261019-01.json?ref=nex-receipts")
+          data = json.loads(base64.b64decode(receipt["content"]))
+          if (data.get("submission_id") != "forge-pr-gate-20261019-01"
+              or data.get("status") != "completed"):
+              raise SystemExit("Independent delivery ledger has no verified proof")
+          print("Verified migrated router and successful delivery on nex-receipts")
+          current = get(f"{path}/rulesets")
+          if current:
+              # Treat existing policies as owned by their creator. Never overwrite.
+              for entry in current:
+                  rule = get(f"{path}/rulesets/{entry['id']}")
+                  configured = set(x["type"] for x in rule.get("rules",[]))
+                  if (rule.get("enforcement") == "active"
+                      and "~DEFAULT_BRANCH" in rule.get("conditions",{}).get("ref_name",{}).get("include",[])
+                      and {"pull_request","deletion","non_fast_forward"}.issubset(configured)
+                      and not rule.get("bypass_actors",[])):
+                      print(f"Already protected: {repo}")
+                      break
+              else:
+                  raise SystemExit(f"{repo} already has an unmatched ruleset. Manual review required.")
+          else:
+              branch=get(f"{path}/branches/{expected}")
+              if branch.get("protected"):
+                  raise SystemExit(f"{repo} already has branch protection. Manual review required.")
+              policy={
+                  "name":"Production safety gate",
+                  "target":"branch",
+                  "enforcement":"active",
+                  "bypass_actors":[],
+                  "conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},
+                  "rules":[
+                      {"type":"deletion"},
+                      {"type":"non_fast_forward"},
+                      {"type":"pull_request","parameters":{
+                          "required_approving_review_count":0,
+                          "dismiss_stale_reviews_on_push":False,
+                          "required_reviewers":[],
+                          "require_code_owner_review":False,
+                          "require_last_push_approval":False,
+                          "required_review_thread_resolution":False,
+                          "require_extra_approval_for_unattributed_changes":True,
+                          "allowed_merge_methods":["merge","squash","rebase"]
+                      }}
+                  ]
+              }
+              result = subprocess.run(
+                  ["gh","api","--method","POST",f"{path}/rulesets","--input","-"],
+                  input=json.dumps(policy), text=True,capture_output=True
+              )
+              if result.returncode:
+                  raise SystemExit("Ruleset creation failed for "+repo+": "+result.stderr[-1400:])
+              created=json.loads(result.stdout)
+              print(f"Ruleset created: {repo} #{created['id']}")
+          # Verify the final effective setting, not just HTTP success.
+          branch=get(f"{path}/branches/{expected}")
+          if not branch.get("protected"):
+              raise SystemExit(f"GitHub did not report {repo}:{expected} as protected")
+          print(f"Verified protected production: {repo}:{expected}")
+          PY
