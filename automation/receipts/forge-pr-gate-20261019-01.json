@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "submission_id": "forge-pr-gate-20261019-01",
+  "status": "completed",
+  "kind": "files",
+  "repository": "BjornThorson/forge-layout-lab",
+  "workflow_run": "https://github.com/BjornThorson/Project-automation/actions/runs/39481040385",
+  "completed_at": "2026-10-20T19:09:53.257231+00:00"
+}
