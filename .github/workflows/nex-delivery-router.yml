@@ -178,14 +178,20 @@ jobs:
                           continue
                       receipt_url = ("https://api.github.com/repos/BjornThorson/Project-automation"
                                      f"/contents/automation/receipts/{sid}.json")
-                      lookup = requests.get(receipt_url, headers={
-                          "Authorization": "Bearer " + os.environ["ROUTER_TOKEN"],
-                          "Accept": "application/vnd.github+json"
-                      }, timeout=20)
-                      if lookup.status_code == 200:
+                      # Read old receipts from main and new receipts from a dedicated ledger.
+                      existing_receipt = False
+                      for ledger_ref in ("main", "nex-receipts"):
+                          lookup = requests.get(receipt_url, headers={
+                              "Authorization": "Bearer " + os.environ["ROUTER_TOKEN"],
+                              "Accept": "application/vnd.github+json"
+                          }, params={"ref": ledger_ref}, timeout=20)
+                          if lookup.status_code == 200:
+                              existing_receipt = True
+                              break
+                          if lookup.status_code != 404:
+                              lookup.raise_for_status()
+                      if existing_receipt:
                           continue
-                      if lookup.status_code != 404:
-                          lookup.raise_for_status()
                       chosen = entry
                       break
                   submission = chosen or {"schema_version": 2, "status": "idle"}
@@ -347,16 +353,38 @@ jobs:
                      "kind": os.environ["KIND"], "repository": os.environ["DESTINATION"],
                      "workflow_run": os.environ["RUN_URL"],
                      "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
-          url = f"https://api.github.com/repos/BjornThorson/Project-automation/contents/automation/receipts/{sid}.json"
+          repo_api = "https://api.github.com/repos/BjornThorson/Project-automation"
+          ledger_branch = "nex-receipts"
+          url = f"{repo_api}/contents/automation/receipts/{sid}.json"
           headers = {"Authorization": "Bearer " + os.environ["GH_AUTH"], "Accept": "application/vnd.github+json"}
-          previous = requests.get(url, headers=headers, timeout=20)
-          if previous.status_code not in (200, 404):
-              previous.raise_for_status()
-          body = {"message": f"chore: receipt for {sid}", "branch": "main",
-                  "content": base64.b64encode((json.dumps(receipt, indent=2) + "\n").encode()).decode()}
+          # Receipt-only branch; keeping audit commits away from protected main.
+          branch_url = f"{repo_api}/git/ref/heads/{ledger_branch}"
+          ref = requests.get(branch_url, headers=headers, timeout=20)
+          if ref.status_code == 404:
+              main_ref = requests.get(f"{repo_api}/git/ref/heads/main", headers=headers, timeout=20)
+              main_ref.raise_for_status()
+              create = requests.post(f"{repo_api}/git/refs", headers=headers,
+                  json={"ref": f"refs/heads/{ledger_branch}",
+                        "sha": main_ref.json()["object"]["sha"]}, timeout=20)
+              if create.status_code == 422:
+                  confirm = requests.get(branch_url, headers=headers, timeout=20)
+                  confirm.raise_for_status()
+              else:
+                  create.raise_for_status()
+          else:
+              ref.raise_for_status()
+          previous = requests.get(url, headers=headers, params={"ref": ledger_branch}, timeout=20)
           if previous.status_code == 200:
-              body["sha"] = previous.json()["sha"]
-          write = requests.put(url, headers=headers, json=body, timeout=20)
-          write.raise_for_status()
-          print(f"Saved {status} receipt for {sid}")
+              # Receipt outcomes are immutable: do not overwrite an earlier result.
+              print(f"Receipt already exists on {ledger_branch}: {sid}")
+          else:
+              if previous.status_code != 404:
+                  previous.raise_for_status()
+              body = {"message": f"chore: receipt for {sid}", "branch": ledger_branch,
+                      "content": base64.b64encode((json.dumps(receipt, indent=2) + "\n").encode()).decode()}
+              write = requests.put(url, headers=headers, json=body, timeout=20)
+              write.raise_for_status()
+              confirm = requests.get(url, headers=headers, params={"ref": ledger_branch}, timeout=20)
+              confirm.raise_for_status()
+              print(f"Saved {status} receipt for {sid} on {ledger_branch}")
           PYTHON
