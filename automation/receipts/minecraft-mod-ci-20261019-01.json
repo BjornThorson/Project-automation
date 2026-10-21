@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "submission_id": "minecraft-mod-ci-20261019-01",
+  "status": "completed",
+  "kind": "files",
+  "repository": "BjornThorson/Mystical-Automation-Unoffical-Backport-1.20.1",
+  "workflow_run": "https://github.com/BjornThorson/Project-automation/actions/runs/39524679527",
+  "completed_at": "2026-10-21T01:00:16.250425+00:00"
+}
